@@ -1,0 +1,138 @@
+# Я решил начать с создания неймспейса, чтобы проекты не перескались друг с другом и выполнялись изолированно
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mindbox
+---
+# Дальше создал простой Sevice, чтобы была внутренняя сеть. 
+# Стоит уточнить, что на production ready скорее всего будет Type LoadBalancer и Ingress как отдельная сущность.
+# но для этого нужны облачные ресурсы или metalLB, которых у меня сейчас нет
+apiVersion: v1
+kind: Service
+metadata:
+  name: mindapp
+  namespace: mindbox
+spec:
+  selector:
+    app: mindapp
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: ClusterIP
+---
+# Deployment 
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mindapp
+  namespace: mindbox
+  labels:
+    app: mindapp
+spec:
+  # Сейчас установим 2 реплики, это непостояное значение, скорее базовый уровень доступности ночью
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mindapp
+  # Cтратегия плавного обновления. Используется по умолчанию, нет простоев
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mindapp
+    spec:
+      terminationGracePeriodSeconds: 30  # даём время завершить запросы при остановке
+      # предпочтительная анти-афинити по зоне/хосту, чтобы равномерно распределять поды по нодам. 
+      # у нас нод много, это хорошо - мы повысим устойчивость
+      # вдохновлено тут https://habr.com/ru/companies/otus/articles/576944/
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - mindapp
+                # Спред по зонам (каждый под стараемся разместить в другой зоне)
+                topologyKey: topology.kubernetes.io/zone
+
+      containers:
+        - name: mindapp
+          # Возьмем для тестирования
+          image: nginx:stable
+          ports:
+            - containerPort: 8080
+          resources:
+            # requests - что мы гарантируем, limits - максимум
+            requests:
+              cpu: "100m"    # Примерно 0.1 CPU
+              memory: "128Mi"
+            limits:
+              cpu: "500m"    # даём возможность начального увеличения CPU 
+              memory: "256Mi"
+          # Пробы: чтобы pod не принимал трафик пока не готов (startup + readiness) вдохновлялся тут https://habr.com/ru/companies/slurm/articles/692450/
+          startupProbe:
+            httpGet:
+              path: /
+              port: 80
+            # 10 попыток по 1 с = до 10 с (покрывает 10-секундный старт)
+            failureThreshold: 10
+            periodSeconds: 1
+          # readinessProbe — чтобы под не принимал трафик пока не готов
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 2
+            
+---
+# HPA (масштабирование по CPU). Нужна для того, чтобы не крутить ночью лишние поды, а днем в пиковые нагрузки увеличивать их колво
+# Требует установленного metrics-server в кластере. Я запускал в kind, так что там еще и параметры деплоя metrics-server надо изменить
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mindapp-hpa
+  namespace: mindbox
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mindapp
+  minReplicas: 2
+  maxReplicas: 6 # для отказоустойчивости. иначе в пике 4 работают, один выходит из строя и уже всё приложение загибается
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Если средняя загрузка CPU для pod выше 50% от requests (100m),
+          # HPA начнёт масштабировать вверх.
+          averageUtilization: 50
+---
+# PodDisruptionBudget — чтобы при обновлениях не снять все сразу
+# мой источник https://habr.com/ru/companies/nixys/articles/490680/
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mindapp-pdb
+  namespace: mindbox
+spec:
+  minAvailable: 1   # всегда оставляем хотя бы 1 доступный под
+  selector:
+    matchLabels:
+      app: mindapp
+
+# манифест пусть и не production ready, но рабочий. за время выполнения тестового я узнал про affinity и PodDisruptionBudget, а также повторил другие основы.
+# было увлекательно
+# хочу также поделиться тем, что я писал helm чарт (там были deploy, hpa, svc, serviceaccount) хотя он потом еще при добавлении в проект был дополнен. 
+# он рабочий и вот на него ссылка https://github.com/Arterps21/hehehelm
